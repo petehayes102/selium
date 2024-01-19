@@ -128,18 +128,17 @@ async fn handle_connection(
     );
 
     loop {
-        let connection = connection.clone();
         let stream = connection.accept_bi().await;
         let stream = match stream {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                 info!("Connection closed ({})", connection.remote_address());
                 return Ok(());
             }
-            Err(e) => {
-                bail!(e)
-            }
+            Err(e) => bail!(e),
             Ok(stream) => BiStream::from(stream),
         };
+
+        // Perform connection handshake
 
         let topics_clone = topics.clone();
         let topic_handles_clone = topic_handles.clone();
