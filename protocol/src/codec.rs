@@ -1,357 +1,415 @@
-use crate::Frame;
-use anyhow::Result;
-use bytes::{Buf, BufMut, BytesMut};
-use selium_std::errors::{ProtocolError, SeliumError};
-use std::mem::size_of;
+use std::{io, path::PathBuf};
+
+use crate::frame::{Frame, FrameType, StreamType};
+use bincode::{
+    config::Configuration,
+    error::{DecodeError, EncodeError},
+};
+use bytes::BytesMut;
+use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
-const MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
-const LEN_MARKER_SIZE: usize = size_of::<u64>();
-const TYPE_MARKER_SIZE: usize = size_of::<u8>();
-const RESERVED_SIZE: usize = LEN_MARKER_SIZE + TYPE_MARKER_SIZE;
+const MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 mebibyte
+const SENDING: bool = true;
+const RECEIVING: bool = false;
 
-#[derive(Debug, Default)]
-pub struct MessageCodec;
+pub struct Codec {
+    bincode_conf: Configuration,
+    last_frame: FrameType,
+    max_frame_size: usize,
+    stream_type: Option<StreamType>,
+    path: Option<PathBuf>,
+}
 
-impl Encoder<Frame> for MessageCodec {
-    type Error = SeliumError;
+#[derive(Debug, Error)]
+pub enum CodecError {
+    #[error("could not decode Frame: {0:?}")]
+    Decode(#[from] DecodeError),
+    #[error("could not encode Frame: {0:?}")]
+    Encode(#[from] EncodeError),
+    #[error("Frame size ({0} bytes) is greater than maximum allowed size ({1} bytes).")]
+    FrameTooLarge(usize, usize),
+    #[error("Unexpected Frame {0} received after {1}")]
+    FrameOutOfOrder(FrameType, FrameType),
+    #[error("error during read/write operation: {0:?}")]
+    Io(#[from] io::Error),
+}
 
-    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let length = item.get_length()?;
-        validate_payload_length(length)?;
+impl Codec {
+    pub fn get_path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
+    }
+}
 
-        let message_type = item.get_type();
+impl Codec {
+    fn is_publisher(&self) -> bool {
+        self.stream_type == Some(StreamType::Publisher)
+    }
 
-        dst.reserve(RESERVED_SIZE + length as usize);
-        dst.put_u64(length);
-        dst.put_u8(message_type);
-        item.write_to_bytes(dst)?;
+    fn is_subscriber(&self) -> bool {
+        self.stream_type == Some(StreamType::Subscriber)
+    }
+
+    fn is_replier(&self) -> bool {
+        self.stream_type == Some(StreamType::Replier)
+    }
+
+    fn is_requestor(&self) -> bool {
+        self.stream_type == Some(StreamType::Requestor)
+    }
+
+    fn is_valid_newstream(&self, sending: bool) -> bool {
+        sending && self.last_frame == FrameType::Init
+    }
+
+    fn is_valid_pubsub(&self, sending: bool) -> bool {
+        ((self.is_publisher() && sending) || (self.is_subscriber() && !sending))
+            && [
+                FrameType::NewStream,
+                FrameType::Message,
+                FrameType::Batch,
+                FrameType::Signal,
+            ]
+            .contains(&self.last_frame)
+    }
+
+    fn is_valid_reply(&self, sending: bool) -> bool {
+        self.is_requestor()
+            && !sending
+            && [FrameType::Request, FrameType::Reply, FrameType::Signal].contains(&self.last_frame)
+    }
+
+    fn is_valid_request(&self, sending: bool) -> bool {
+        self.is_requestor()
+            && sending
+            && [
+                FrameType::NewStream,
+                FrameType::Request,
+                FrameType::Reply,
+                FrameType::Signal,
+            ]
+            .contains(&self.last_frame)
+    }
+
+    fn is_valid_server_reply(&self, sending: bool) -> bool {
+        self.is_replier()
+            && sending
+            && [
+                FrameType::ServerRequest,
+                FrameType::ServerReply,
+                FrameType::Signal,
+            ]
+            .contains(&self.last_frame)
+    }
+
+    fn is_valid_server_request(&self, sending: bool) -> bool {
+        self.is_replier()
+            && !sending
+            && [
+                FrameType::NewStream,
+                FrameType::ServerRequest,
+                FrameType::ServerReply,
+                FrameType::Signal,
+            ]
+            .contains(&self.last_frame)
+    }
+
+    fn state(&mut self, item: &Frame, sending: bool) -> Result<(), CodecError> {
+        match item {
+            Frame::Batch(_) | Frame::Message(_) if self.is_valid_pubsub(sending) => (),
+            Frame::NewStream(ty, path) if self.is_valid_newstream(sending) => {
+                self.stream_type = Some(*ty);
+                self.path = Some(path.to_owned());
+            }
+            Frame::Reply(_, _) if self.is_valid_reply(sending) => (),
+            Frame::Request(_, _) if self.is_valid_request(sending) => (),
+            Frame::ServerReply(_, _, _) if self.is_valid_server_reply(sending) => (),
+            Frame::ServerRequest(_, _, _) if self.is_valid_server_request(sending) => (),
+            Frame::Signal(_) if !sending => (),
+            _ => return Err(CodecError::FrameOutOfOrder(item.ty(), self.last_frame)),
+        }
+
+        self.last_frame = item.ty();
 
         Ok(())
     }
 }
 
-impl Decoder for MessageCodec {
-    type Error = SeliumError;
+impl Default for Codec {
+    fn default() -> Self {
+        Codec {
+            bincode_conf: bincode::config::standard(),
+            last_frame: FrameType::Init,
+            max_frame_size: MAX_FRAME_SIZE,
+            stream_type: None,
+            path: None,
+        }
+    }
+}
+
+impl Encoder<Frame> for Codec {
+    type Error = CodecError;
+
+    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.state(&item, SENDING)?;
+
+        let size = item.size();
+        if size > self.max_frame_size {
+            return Err(CodecError::FrameTooLarge(size, self.max_frame_size));
+        }
+
+        bincode::encode_into_slice(&item, dst, self.bincode_conf)?;
+
+        Ok(())
+    }
+}
+
+impl Decoder for Codec {
     type Item = Frame;
+    type Error = CodecError;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < RESERVED_SIZE {
-            return Ok(None);
-        }
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>, Self::Error> {
+        let frame: Frame = match bincode::decode_from_slice(buf, self.bincode_conf) {
+            Ok((frame, _)) => frame,
+            Err(DecodeError::UnexpectedEnd { additional }) => {
+                buf.reserve(additional);
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        };
 
-        let mut length_bytes = [0u8; LEN_MARKER_SIZE];
-        length_bytes.copy_from_slice(&src[..LEN_MARKER_SIZE]);
-
-        let length = u64::from_be_bytes(length_bytes);
-        validate_payload_length(length)?;
-
-        let bytes_read = src.len() - RESERVED_SIZE;
-
-        if bytes_read < length as usize {
-            src.reserve(bytes_read);
-            return Ok(None);
-        }
-
-        src.advance(LEN_MARKER_SIZE);
-
-        let message_type = src.get_u8();
-        let bytes = src.split_to(length as usize);
-        let frame = Frame::try_from((message_type, bytes))?;
+        self.state(&frame, RECEIVING)?;
 
         Ok(Some(frame))
     }
 }
 
-fn validate_payload_length(length: u64) -> Result<(), SeliumError> {
-    if length > MAX_MESSAGE_SIZE {
-        Err(ProtocolError::PayloadTooLarge(length, MAX_MESSAGE_SIZE))?
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    use crate::frame::Signal;
 
     use super::*;
-    use crate::error_codes::UNKNOWN_ERROR;
-    use crate::utils::encode_message_batch;
-    use crate::{
-        ErrorPayload, MessagePayload, Operation, PublisherPayload, SubscriberPayload, TopicName,
-    };
-    use bytes::Bytes;
 
-    #[test]
-    fn encodes_register_subscriber_frame() {
-        let topic = TopicName::try_from("/namespace/topic").unwrap();
-
-        let frame = Frame::RegisterSubscriber(SubscriberPayload {
-            topic,
-            retention_policy: 5,
-            operations: vec![
-                Operation::Map("first/module.wasm".into()),
-                Operation::Map("second/module.wasm".into()),
-                Operation::Filter("third/module.wasm".into()),
-            ],
-        });
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from_static(b"\0\0\0\0\0\0\0\x86\x01\t\0\0\0\0\0\0\0namespace\x05\0\0\0\0\0\0\0topic\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\0\0\0\0\x11\0\0\0\0\0\0\0first/module.wasm\0\0\0\0\x12\0\0\0\0\0\0\0second/module.wasm\x01\0\0\0\x11\0\0\0\0\0\0\0third/module.wasm");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
+    fn check_state(frames: &[(Frame, bool)]) {
+        let mut codec = Codec::default();
+        frames
+            .iter()
+            .for_each(|(frame, sending)| codec.state(frame, *sending).unwrap());
     }
 
     #[test]
-    fn encodes_register_publisher_frame() {
-        let topic = TopicName::try_from("/namespace/topic").unwrap();
+    fn test_newstream_state() {
+        let mut codec = Codec::default();
+        codec
+            .state(
+                &Frame::NewStream(StreamType::Publisher, "/moo/cow".into()),
+                SENDING,
+            )
+            .unwrap();
 
-        let frame = Frame::RegisterPublisher(PublisherPayload {
-            topic,
-            retention_policy: 5,
-            operations: vec![
-                Operation::Map("first/module.wasm".into()),
-                Operation::Map("second/module.wasm".into()),
-                Operation::Filter("third/module.wasm".into()),
-            ],
-        });
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from_static(b"\0\0\0\0\0\0\0\x86\0\t\0\0\0\0\0\0\0namespace\x05\0\0\0\0\0\0\0topic\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\0\0\0\0\x11\0\0\0\0\0\0\0first/module.wasm\0\0\0\0\x12\0\0\0\0\0\0\0second/module.wasm\x01\0\0\0\x11\0\0\0\0\0\0\0third/module.wasm");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
+        assert_eq!(codec.stream_type, Some(StreamType::Publisher));
+        assert_eq!(
+            codec.get_path(),
+            Some(&PathBuf::from_str("/moo/cow").unwrap())
+        );
     }
 
     #[test]
-    fn encodes_message_frame_with_header() {
-        let mut h = HashMap::new();
-        h.insert("test".to_owned(), "header".to_owned());
-
-        let frame = Frame::Message(MessagePayload {
-            headers: Some(h),
-            message: Bytes::from("Hello world"),
-        });
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from_static(b"\0\0\0\0\0\0\06\x04\x01\x01\0\0\0\0\0\0\0\x04\0\0\0\0\0\0\0test\x06\0\0\0\0\0\0\0header\x0b\0\0\0\0\0\0\0Hello world");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
-    }
-
-    #[test]
-    fn encodes_message_frame_without_header() {
-        let frame = Frame::Message(MessagePayload {
-            headers: None,
-            message: Bytes::from("Hello world"),
-        });
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from("\0\0\0\0\0\0\0\x14\x04\0\x0b\0\0\0\0\0\0\0Hello world");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
-    }
-
-    #[test]
-    fn encodes_batch_message_frame() {
-        let batch = encode_message_batch(vec![
-            Bytes::from("First message"),
-            Bytes::from("Second message"),
-            Bytes::from("Third message"),
+    fn test_pub_ok() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Publisher, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Message(Vec::new()), SENDING),
+            (Frame::Message(Vec::new()), SENDING),
+            (Frame::Batch(Vec::new()), SENDING),
+            (Frame::Signal(Signal::UnknownError), RECEIVING),
+            (Frame::Message(Vec::new()), SENDING),
         ]);
-
-        let frame = Frame::BatchMessage(batch);
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from("\0\0\0\0\0\0\0H\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\rFirst message\0\0\0\0\0\0\0\x0eSecond message\0\0\0\0\0\0\0\rThird message");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
     }
 
     #[test]
-    fn encodes_error_frame() {
-        let frame = Frame::Error(ErrorPayload {
-            code: UNKNOWN_ERROR,
-            message: "This is an error".into(),
-        });
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected =
-            Bytes::from_static(b"\0\0\0\0\0\0\0\x1c\x06\0\0\0\0\x10\0\0\0\0\0\0\0This is an error");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
-    }
-
-    #[test]
-    fn encodes_ok_frame() {
-        let frame = Frame::Ok;
-
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-        let expected = Bytes::from_static(b"\0\0\0\0\0\0\0\0\x07");
-
-        codec.encode(frame, &mut buffer).unwrap();
-
-        assert_eq!(buffer, expected);
-    }
-
-    #[test]
-    fn fails_to_encode_if_payload_too_large() {
-        const PAYLOAD: [u8; MAX_MESSAGE_SIZE as usize + 1] = [0u8; MAX_MESSAGE_SIZE as usize + 1];
-
-        let frame = Frame::Message(MessagePayload {
-            headers: None,
-            message: Bytes::from_static(&PAYLOAD),
-        });
-        let mut codec = MessageCodec;
-        let mut buffer = BytesMut::new();
-
-        assert!(codec.encode(frame, &mut buffer).is_err());
-    }
-
-    #[test]
-    fn decodes_register_subscriber_frame() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from(&b"\0\0\0\0\0\0\0\x86\x01\t\0\0\0\0\0\0\0namespace\x05\0\0\0\0\0\0\0topic\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\0\0\0\0\x11\0\0\0\0\0\0\0first/module.wasm\0\0\0\0\x12\0\0\0\0\0\0\0second/module.wasm\x01\0\0\0\x11\0\0\0\0\0\0\0third/module.wasm"[..]);
-        let topic = TopicName::try_from("/namespace/topic").unwrap();
-
-        let expected = Frame::RegisterSubscriber(SubscriberPayload {
-            topic,
-            retention_policy: 5,
-            operations: vec![
-                Operation::Map("first/module.wasm".into()),
-                Operation::Map("second/module.wasm".into()),
-                Operation::Filter("third/module.wasm".into()),
-            ],
-        });
-
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn decodes_register_publisher_frame() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from(&b"\0\0\0\0\0\0\0\x86\0\t\0\0\0\0\0\0\0namespace\x05\0\0\0\0\0\0\0topic\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\0\0\0\0\x11\0\0\0\0\0\0\0first/module.wasm\0\0\0\0\x12\0\0\0\0\0\0\0second/module.wasm\x01\0\0\0\x11\0\0\0\0\0\0\0third/module.wasm"[..]);
-        let topic = TopicName::try_from("/namespace/topic").unwrap();
-
-        let expected = Frame::RegisterPublisher(PublisherPayload {
-            topic,
-            retention_policy: 5,
-            operations: vec![
-                Operation::Map("first/module.wasm".into()),
-                Operation::Map("second/module.wasm".into()),
-                Operation::Filter("third/module.wasm".into()),
-            ],
-        });
-
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn decodes_message_frame_with_header() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from("\0\0\0\0\0\0\06\x04\x01\x01\0\0\0\0\0\0\0\x04\0\0\0\0\0\0\0test\x06\0\0\0\0\0\0\0header\x0b\0\0\0\0\0\0\0Hello world");
-
-        let mut h = HashMap::new();
-        h.insert("test".to_owned(), "header".to_owned());
-
-        let expected = Frame::Message(MessagePayload {
-            headers: Some(h),
-            message: Bytes::from("Hello world"),
-        });
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn decodes_message_frame_without_header() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from("\0\0\0\0\0\0\0\x14\x04\0\x0b\0\0\0\0\0\0\0Hello world");
-
-        let expected = Frame::Message(MessagePayload {
-            headers: None,
-            message: Bytes::from("Hello world"),
-        });
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn decodes_batch_message_frame() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from("\0\0\0\0\0\0\0H\x05\0\0\0\0\0\0\0\x03\0\0\0\0\0\0\0\rFirst message\0\0\0\0\0\0\0\x0eSecond message\0\0\0\0\0\0\0\rThird message");
-
-        let batch = encode_message_batch(vec![
-            Bytes::from("First message"),
-            Bytes::from("Second message"),
-            Bytes::from("Third message"),
+    fn test_sub_ok() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Subscriber, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Signal(Signal::UnknownError), RECEIVING),
+            (Frame::Message(Vec::new()), RECEIVING),
+            (Frame::Message(Vec::new()), RECEIVING),
+            (Frame::Batch(Vec::new()), RECEIVING),
+            (Frame::Message(Vec::new()), RECEIVING),
         ]);
-
-        let expected = Frame::BatchMessage(batch);
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
     }
 
     #[test]
-    fn decodes_error_frame() {
-        let mut codec = MessageCodec;
-        let mut src =
-            BytesMut::from("\0\0\0\0\0\0\0\x1c\x06\0\0\0\0\x10\0\0\0\0\0\0\0This is an error");
-
-        let expected = Frame::Error(ErrorPayload {
-            code: UNKNOWN_ERROR,
-            message: "This is an error".into(),
-        });
-
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
+    fn test_req_ok() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Requestor, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Request(0, Vec::new()), SENDING),
+            (Frame::Reply(0, Vec::new()), RECEIVING),
+            (Frame::Request(1, Vec::new()), SENDING),
+            (Frame::Request(2, Vec::new()), SENDING),
+            (Frame::Reply(2, Vec::new()), RECEIVING),
+            (Frame::Reply(1, Vec::new()), RECEIVING),
+            (Frame::Signal(Signal::UnknownError), RECEIVING),
+        ]);
     }
 
     #[test]
-    fn decodes_ok_frame() {
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from("\0\0\0\0\0\0\0\0\x07");
-
-        let expected = Frame::Ok;
-
-        let result = codec.decode(&mut src).unwrap().unwrap();
-
-        assert_eq!(result, expected);
+    fn test_rep_ok() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Replier, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::ServerRequest(12, 0, Vec::new()), RECEIVING),
+            (Frame::Signal(Signal::UnknownError), RECEIVING),
+            (Frame::ServerRequest(16, 1, Vec::new()), RECEIVING),
+            (Frame::ServerReply(16, 1, Vec::new()), SENDING),
+            (Frame::ServerReply(12, 0, Vec::new()), SENDING),
+            (Frame::ServerRequest(1056, 2, Vec::new()), RECEIVING),
+            (Frame::ServerReply(1056, 2, Vec::new()), SENDING),
+        ]);
     }
 
     #[test]
-    fn fails_to_decode_if_payload_too_large() {
-        const PAYLOAD: [u8; MAX_MESSAGE_SIZE as usize + 1] = [0u8; MAX_MESSAGE_SIZE as usize + 1];
+    #[should_panic]
+    fn test_missing_newstream() {
+        check_state(&[
+            (Frame::ServerRequest(12, 0, Vec::new()), RECEIVING),
+            (Frame::ServerRequest(16, 1, Vec::new()), RECEIVING),
+            (Frame::ServerReply(16, 1, Vec::new()), SENDING),
+            (Frame::ServerReply(12, 0, Vec::new()), SENDING),
+            (Frame::ServerRequest(1056, 2, Vec::new()), RECEIVING),
+            (Frame::ServerReply(1056, 2, Vec::new()), SENDING),
+        ]);
+    }
 
-        let mut codec = MessageCodec;
-        let mut src = BytesMut::from(&PAYLOAD[..]);
+    #[test]
+    #[should_panic]
+    fn test_recv_newstream() {
+        check_state(&[(
+            Frame::NewStream(StreamType::Requestor, "/moo/cow".into()),
+            RECEIVING,
+        )]);
+    }
 
-        assert!(codec.decode(&mut src).is_err());
+    #[test]
+    #[should_panic]
+    fn test_rep_using_req_frames() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Replier, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Request(0, Vec::new()), RECEIVING),
+            (Frame::Reply(0, Vec::new()), SENDING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_rep_reply_before_request() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Replier, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::ServerReply(0, 0, Vec::new()), SENDING),
+            (Frame::ServerRequest(0, 0, Vec::new()), RECEIVING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_rep_receive_reply() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Replier, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::ServerReply(0, 0, Vec::new()), RECEIVING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_req_receive_request() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Requestor, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Request(0, Vec::new()), RECEIVING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_req_receive_server_reply() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Requestor, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::ServerReply(0, 0, Vec::new()), RECEIVING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_pub_recv_message() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Publisher, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Message(Vec::new()), RECEIVING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_sub_send_message() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Subscriber, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Message(Vec::new()), SENDING),
+        ]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_send_signal() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Subscriber, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Signal(Signal::UnknownError), SENDING),
+        ]);
+    }
+
+    #[test]
+    fn test_recv_signal() {
+        check_state(&[
+            (
+                Frame::NewStream(StreamType::Subscriber, "/moo/cow".into()),
+                SENDING,
+            ),
+            (Frame::Signal(Signal::UnknownError), RECEIVING),
+        ]);
     }
 }

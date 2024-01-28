@@ -1,0 +1,27 @@
+title: |md
+  # Request-Reply v1
+| {near: top-center}
+
+classes: {
+  reply: {
+    style.stroke-dash: 3
+  }
+}
+
+shape: sequence_diagram
+
+r: Requestor
+s: Server
+p: Replier
+
+r."Request ID: <u32> + <= 1Mib bytes: <bytes>"
+r -> s: 0some request
+s."Server request ID: <u64> + Requestor payload <bytes>"
+s -> p: 00some request
+s <- p: 00some reply {
+  class: reply
+}
+s."Strip server request ID"
+r <- s: 0some reply {
+  class: reply
+}

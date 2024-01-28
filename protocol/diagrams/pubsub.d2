@@ -1,0 +1,15 @@
+title: |md
+  # Publish-Subscribe v1
+| {near: top-center}
+
+shape: sequence_diagram
+
+p: Publisher
+sv: Server
+s: Subscribers {
+  style.multiple: true
+}
+
+p."Message type: <u8> + <= 1Mib bytes: <bytes>"
+p -> sv: 0some bytes
+sv -> s: 0some bytes

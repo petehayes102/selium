@@ -1,142 +1,101 @@
-use crate::TopicName;
-use bytes::{BufMut, Bytes, BytesMut};
-use selium_std::errors::{ProtocolError, Result, SeliumError};
-use std::collections::HashMap;
+use std::{
+    fmt::{Display, Formatter},
+    path::PathBuf,
+};
 
-const REGISTER_PUBLISHER: u8 = 0x0;
-const REGISTER_SUBSCRIBER: u8 = 0x1;
-const REGISTER_REPLIER: u8 = 0x2;
-const REGISTER_REQUESTOR: u8 = 0x3;
-const MESSAGE: u8 = 0x4;
-const BATCH_MESSAGE: u8 = 0x5;
-const ERROR: u8 = 0x6;
-const OK: u8 = 0x7;
+use bincode::{Decode, Encode};
 
-#[derive(Debug, PartialEq)]
-pub enum ConnectFrame {
-    // Topic name, retention policy
-    RegisterPublisher(TopicName, u64),
-    // Topic name, retention policy
-    RegisterSubscriber(TopicName, u64),
-    RegisterReplier(TopicName),
-    RegisterRequestor(TopicName),
+#[derive(Decode, Encode)]
+pub enum Signal {
+    CloudAuthFailed,
+    InvalidTopicName,
+    ReplierAlreadyBound,
+    Shutdown,
+    ShutdownInProgress,
+    StreamClosedPrematurely,
+    UnknownError,
 }
 
-#[derive(Debug, PartialEq)]
-pub enum RequestFrame {
-    // Headers, Message
-    Message(Option<HashMap<String, String>>, Bytes),
-    BatchMessage(Bytes),
+#[derive(Copy, Clone, Debug, Decode, Encode, PartialEq)]
+pub enum StreamType {
+    Publisher,
+    Subscriber,
+    Requestor,
+    Replier,
 }
 
-pub type ReplyFrame = Result<(), (u32, Bytes)>;
+#[derive(Decode, Encode)]
+pub enum Frame {
+    Batch(Vec<u8>),
+    Message(Vec<u8>),
+    NewStream(StreamType, PathBuf),
+    Reply(u32, Vec<u8>),
+    Request(u32, Vec<u8>),
+    ServerReply(u64, u32, Vec<u8>),
+    ServerRequest(u64, u32, Vec<u8>),
+    Signal(Signal), // Signals from server to client
+}
 
-// impl Frame {
-//     pub fn get_length(&self) -> Result<u64> {
-//         Ok(match self {
-//             Self::RegisterPublisher(payload) => {
-//                 bincode::serialized_size(payload).map_err(ProtocolError::SerdeError)?
-//             }
-//             Self::RegisterSubscriber(payload) => {
-//                 bincode::serialized_size(payload).map_err(ProtocolError::SerdeError)?
-//             }
-//             Self::RegisterReplier(payload) => {
-//                 bincode::serialized_size(payload).map_err(ProtocolError::SerdeError)?
-//             }
-//             Self::RegisterRequestor(payload) => {
-//                 bincode::serialized_size(payload).map_err(ProtocolError::SerdeError)?
-//             }
-//             Self::Message(payload) => {
-//                 bincode::serialized_size(payload).map_err(ProtocolError::SerdeError)?
-//             }
-//             Self::BatchMessage(bytes) => bytes.len() as u64,
-//             Self::Error(bytes) => bytes.len() as u64,
-//             Self::Ok => 0,
-//         })
-//     }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FrameType {
+    Init, // used to initialize Codec before any frames have been received
+    Batch,
+    Message,
+    NewStream,
+    Reply,
+    Request,
+    ServerReply,
+    ServerRequest,
+    Signal,
+}
 
-//     pub fn get_type(&self) -> u8 {
-//         match self {
-//             Self::RegisterPublisher(_) => REGISTER_PUBLISHER,
-//             Self::RegisterSubscriber(_) => REGISTER_SUBSCRIBER,
-//             Self::RegisterReplier(_) => REGISTER_REPLIER,
-//             Self::RegisterRequestor(_) => REGISTER_REQUESTOR,
-//             Self::Message(_) => MESSAGE,
-//             Self::BatchMessage(_) => BATCH_MESSAGE,
-//             Self::Error(_) => ERROR,
-//             Self::Ok => OK,
-//         }
-//     }
+impl Frame {
+    pub(super) fn ty(&self) -> FrameType {
+        match self {
+            Frame::Batch(_) => FrameType::Batch,
+            Frame::Message(_) => FrameType::Message,
+            Frame::NewStream(_, _) => FrameType::NewStream,
+            Frame::Reply(_, _) => FrameType::Reply,
+            Frame::Request(_, _) => FrameType::Request,
+            Frame::ServerReply(_, _, _) => FrameType::ServerReply,
+            Frame::ServerRequest(_, _, _) => FrameType::ServerRequest,
+            Frame::Signal(_) => FrameType::Signal,
+        }
+    }
 
-//     pub fn get_topic(&self) -> Option<&TopicName> {
-//         match self {
-//             Self::RegisterPublisher(p) => Some(&p.topic),
-//             Self::RegisterSubscriber(s) => Some(&s.topic),
-//             Self::RegisterReplier(s) => Some(&s.topic),
-//             Self::RegisterRequestor(c) => Some(&c.topic),
-//             Self::Message(_) => None,
-//             Self::BatchMessage(_) => None,
-//             Self::Error(_) => None,
-//             Self::Ok => None,
-//         }
-//     }
+    pub(super) fn size(&self) -> usize {
+        match self {
+            Frame::Batch(bytes) => bytes.len(),
+            Frame::Message(bytes) => bytes.len(),
+            Frame::NewStream(_, path) => 1 + path.capacity(),
+            Frame::Reply(_, bytes) | Frame::Request(_, bytes) => 4 + bytes.len(),
+            Frame::ServerReply(_, _, bytes) | Frame::ServerRequest(_, _, bytes) => {
+                8 + 4 + bytes.len()
+            }
+            Frame::Signal(_) => 1,
+        }
+    }
+}
 
-//     pub fn write_to_bytes(self, dst: &mut BytesMut) -> Result<()> {
-//         match self {
-//             Frame::RegisterPublisher(payload) => bincode::serialize_into(dst.writer(), &payload)
-//                 .map_err(ProtocolError::SerdeError)?,
-//             Frame::RegisterSubscriber(payload) => bincode::serialize_into(dst.writer(), &payload)
-//                 .map_err(ProtocolError::SerdeError)?,
-//             Frame::RegisterReplier(payload) => bincode::serialize_into(dst.writer(), &payload)
-//                 .map_err(ProtocolError::SerdeError)?,
-//             Frame::RegisterRequestor(payload) => bincode::serialize_into(dst.writer(), &payload)
-//                 .map_err(ProtocolError::SerdeError)?,
-//             Frame::Message(payload) => bincode::serialize_into(dst.writer(), &payload)
-//                 .map_err(ProtocolError::SerdeError)?,
-//             Frame::BatchMessage(bytes) => dst.extend_from_slice(&bytes),
-//             Frame::Error(bytes) => dst.extend_from_slice(&bytes),
-//             Frame::Ok => (),
-//         }
+impl Display for FrameType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Init => write!(f, "Frame::Init"),
+            Self::Batch => write!(f, "Frame::Batch"),
+            Self::Message => write!(f, "Frame::Message"),
+            Self::NewStream => write!(f, "Frame::NewStream"),
+            Self::Reply => write!(f, "Frame::Reply"),
+            Self::Request => write!(f, "Frame::Request"),
+            Self::ServerReply => write!(f, "Frame::ServerReply"),
+            Self::ServerRequest => write!(f, "Frame::ServerRequest"),
+            Self::Signal => write!(f, "Frame::Signal"),
+        }
+    }
+}
 
-//         Ok(())
-//     }
-
-//     pub fn unwrap_message(self) -> MessagePayload {
-//         match self {
-//             Self::Message(p) => p,
-//             _ => panic!("Attempted to unwrap non-Message Frame variant"),
-//         }
-//     }
-// }
-
-// impl TryFrom<(u8, BytesMut)> for Frame {
-//     type Error = SeliumError;
-
-//     fn try_from(
-//         (message_type, bytes): (u8, BytesMut),
-//     ) -> Result<Self, <Frame as TryFrom<(u8, BytesMut)>>::Error> {
-//         let frame = match message_type {
-//             REGISTER_PUBLISHER => Frame::RegisterPublisher(
-//                 bincode::deserialize(&bytes).map_err(ProtocolError::SerdeError)?,
-//             ),
-//             REGISTER_SUBSCRIBER => Frame::RegisterSubscriber(
-//                 bincode::deserialize(&bytes).map_err(ProtocolError::SerdeError)?,
-//             ),
-//             REGISTER_REPLIER => Frame::RegisterReplier(
-//                 bincode::deserialize(&bytes).map_err(ProtocolError::SerdeError)?,
-//             ),
-//             REGISTER_REQUESTOR => Frame::RegisterRequestor(
-//                 bincode::deserialize(&bytes).map_err(ProtocolError::SerdeError)?,
-//             ),
-//             MESSAGE => {
-//                 Frame::Message(bincode::deserialize(&bytes).map_err(ProtocolError::SerdeError)?)
-//             }
-//             BATCH_MESSAGE => Frame::BatchMessage(bytes.into()),
-//             ERROR => Frame::Error(bytes.into()),
-//             OK => Frame::Ok,
-//             _type => return Err(ProtocolError::UnknownMessageType(_type))?,
-//         };
-
-//         Ok(frame)
-//     }
-// }
+impl From<FrameType> for u8 {
+    fn from(value: FrameType) -> Self {
+        value as u8
+    }
+}

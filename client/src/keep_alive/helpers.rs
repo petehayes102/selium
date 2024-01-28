@@ -1,4 +1,4 @@
-use selium_protocol::error_codes::REPLIER_ALREADY_BOUND;
+use selium_protocol::Signal;
 use selium_std::errors::{QuicError, Result, SeliumError};
 use std::{io, task::Poll};
 
@@ -10,7 +10,7 @@ pub fn is_disconnect_error(err: &io::Error) -> bool {
 }
 
 pub fn is_bind_error(code: u32) -> bool {
-    code == REPLIER_ALREADY_BOUND
+    code == Signal::ReplierAlreadyBound
 }
 
 pub fn is_recoverable_error(err: &SeliumError) -> bool {

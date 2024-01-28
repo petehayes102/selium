@@ -5,17 +5,14 @@ pub mod pubsub;
 pub mod request_reply;
 pub use builder::*;
 use futures::StreamExt;
-use selium_protocol::{
-    error_codes::{STREAM_CLOSED_PREMATURELY, UNKNOWN_ERROR},
-    BiStream, Frame,
-};
+use selium_protocol::Frame;
 use selium_std::errors::{Result, SeliumError};
 
 // Handle response from Selium server on opening a stream
 async fn handle_reply(stream: &mut BiStream) -> Result<()> {
     match stream.next().await {
         Some(Ok(Frame::Ok)) => Ok(()),
-        Some(Ok(Frame::Error(payload))) => match String::from_utf8(payload.message.to_vec()) {
+        Some(Ok(Frame::Signal(payload))) => match String::from_utf8(payload.message.to_vec()) {
             Ok(s) => Err(SeliumError::OpenStream(payload.code, s)),
             Err(_) => Err(SeliumError::OpenStream(
                 payload.code,

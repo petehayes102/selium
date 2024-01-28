@@ -1,0 +1,62 @@
+title: |md
+  # Handshake v1
+| {near: top-center}
+
+classes: {
+  reply: {
+    style.stroke-dash: 3
+  }
+
+  invisible: {
+    style.stroke: transparent
+  }
+}
+
+shape: sequence_diagram
+
+c: Client
+s: Server
+
+Salutation (on connect only)\:: {
+  c."Prefix \"SEL\" + Protocol version: <u16>"
+  c -> s: SEL1
+  If version is supported: {
+    c <- s.1: HEY {
+      class: reply
+    }
+  }
+  If version unsupported: {
+    c <- s.1: BYE {
+      class: reply
+    }
+  }
+  If salutation malformed: {
+    c <- s.1: Drop connection {
+      class: invisible
+    }
+  }
+}
+
+Stream declaration (on stream init only)\:: {
+  c."Stream type: <u8> + Topic length: <u16> + Topic: <utf8>"
+  c -> s: 013example/topic
+  If declaration is valid: {
+    c <- s.2: RDY {
+      class: reply
+    }
+  }
+  If topic is invalid: {
+    c <- s.2: ERR {
+      class: reply
+    }
+    s."Error code: <u8> + Error length: <u16> + Error description: <utf8>"
+    c <- s.2: 120Shutdown in progress {
+      class: reply
+    }
+  }
+  If stream type is invalid: {
+    c <- s.2: Drop connection {
+      class: invisible
+    }
+  }
+}
