@@ -1343,6 +1343,7 @@ version = "0.3.0"
 dependencies = [
  "bincode 2.0.0-rc.3",
  "bytes",
+ "quinn",
  "thiserror",
  "tokio",
  "tokio-util",

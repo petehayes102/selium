@@ -13,6 +13,7 @@ readme.workspace = true
 [dependencies]
 bincode = { version = "2.0.0-rc.3", features = ["derive"] }
 bytes = { version = "1.5", features = ["serde"] }
+quinn = "0.10"
 thiserror = "1.0"
 tokio = "1.35"
 tokio-util = { version = "0.7", features = ["codec"] }
